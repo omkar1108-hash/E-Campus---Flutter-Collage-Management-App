@@ -1,0 +1,62 @@
+rules_version = '2';
+
+// Server-side enforcement of the app's role-based access control (RBAC).
+// Client-side checks only hide UI; these rules are the real security boundary.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function role() { return profile().role; }
+    function isAdmin() { return signedIn() && role() == 'admin'; }
+    function isStaff() { return signedIn() && role() in ['teacher', 'admin']; }
+    function inMyDept(dept) { return dept == profile().department; }
+
+    match /users/{uid} {
+      allow read: if signedIn();
+      // Self-registration is always as a student; only an admin changes roles.
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'student'
+        && request.resource.data.keys().hasOnly(
+             ['name', 'department', 'year', 'role', 'createdAt']);
+      allow update: if isAdmin() && uid != request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role']);
+    }
+
+    match /books/{id} {
+      allow read: if signedIn()
+        && (isAdmin() || resource.data.department in [profile().department, 'ALL']);
+      allow create, update, delete: if isStaff();
+    }
+
+    match /news/{id} {
+      allow read: if signedIn() && (isAdmin() || inMyDept(resource.data.department));
+      allow create: if signedIn() && role() != 'student'
+        && request.resource.data.authorId == request.auth.uid
+        && (isStaff() || inMyDept(request.resource.data.department));
+      allow delete: if isStaff() || (signedIn() && resource.data.authorId == request.auth.uid);
+    }
+
+    // Direct chat id = "<uidA>_<uidB>"; department room id = "dept-<code>".
+    match /chats/{chatId}/messages/{messageId} {
+      function canAccess() {
+        return signedIn()
+          && (request.auth.uid in chatId.split('_')
+              || chatId == ('dept-' + profile().department));
+      }
+      allow read: if canAccess();
+      allow create: if canAccess()
+        && request.resource.data.senderId == request.auth.uid
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 2000;
+    }
+
+    match /bus_locations/{busId} {
+      allow read: if signedIn();
+      allow write: if isStaff();
+    }
+  }
+}
